@@ -8,9 +8,12 @@ import com.mq.model.Partition;
 import com.mq.model.Topic;
 import com.mq.repository.PartitionRepository;
 import com.mq.repository.TopicRepository;
+import com.mq.storage.LogManager;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.io.IOException;
 import java.util.List;
 import java.util.stream.IntStream;
 
@@ -20,6 +23,7 @@ public class TopicService {
 
     private final TopicRepository topicRepository;
     private final PartitionRepository partitionRepository;
+    private final LogManager logManager;
 
     @Transactional
     public TopicResponse createTopic(CreateTopicRequest request) {
@@ -36,6 +40,14 @@ public class TopicService {
                 .mapToObj(i -> new Partition(finalTopic, i))
                 .toList();
         partitionRepository.saveAll(partitions);
+
+        for(int i=0; i<request.getPartitionCount(); i++) {
+            try {
+                logManager.initPartition(finalTopic.getName(), i);
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to create log for partition " + i, e);
+            }
+        }
 
         return toResponse(topic);
     }
