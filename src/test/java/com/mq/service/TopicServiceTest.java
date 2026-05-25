@@ -1,7 +1,7 @@
 package com.mq.service;
 
-import com.mq.dto.CreateTopicRequest;
-import com.mq.dto.TopicResponse;
+import com.mq.dto.request.CreateTopicRequest;
+import com.mq.dto.response.TopicResponse;
 import com.mq.exception.TopicAlreadyExistsException;
 import com.mq.model.Topic;
 import com.mq.repository.PartitionRepository;

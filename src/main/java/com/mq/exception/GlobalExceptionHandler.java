@@ -1,5 +1,6 @@
 package com.mq.exception;
 
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.support.DefaultMessageSourceResolvable;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -12,6 +13,7 @@ import java.util.Map;
 import java.util.stream.Collector;
 import java.util.stream.Collectors;
 
+@Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler {
     @ExceptionHandler(TopicAlreadyExistsException.class)
@@ -36,5 +38,12 @@ public class GlobalExceptionHandler {
                         DefaultMessageSourceResolvable::getDefaultMessage
                 ));
         return ResponseEntity.badRequest().body(errors);
+    }
+
+    @ExceptionHandler(RuntimeException.class)
+    public ResponseEntity<Map<String, String>> handleStorageFailure(RuntimeException ex) {
+        log.error("Internal error : {}", ex.getMessage(), ex);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Map.of("error", "Internal server error: " + ex.getMessage()));
     }
 }
