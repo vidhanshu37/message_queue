@@ -1,7 +1,8 @@
 package com.mq.service;
 
-import com.mq.dto.CreateTopicRequest;
-import com.mq.dto.TopicResponse;
+import com.mq.cluster.BrokerRegistry;
+import com.mq.dto.request.CreateTopicRequest;
+import com.mq.dto.response.TopicResponse;
 import com.mq.exception.TopicAlreadyExistsException;
 import com.mq.exception.TopicNotFoundException;
 import com.mq.model.Partition;
@@ -24,6 +25,7 @@ public class TopicService {
     private final TopicRepository topicRepository;
     private final PartitionRepository partitionRepository;
     private final LogManager logManager;
+    private final BrokerRegistry brokerRegistry;
 
     @Transactional
     public TopicResponse createTopic(CreateTopicRequest request) {
@@ -44,6 +46,12 @@ public class TopicService {
         for(int i=0; i<request.getPartitionCount(); i++) {
             try {
                 logManager.initPartition(finalTopic.getName(), i);
+                if(brokerRegistry.getBrokerCount() > 0) {
+                    brokerRegistry.assignPartitions(
+                            request.getName(),
+                            request.getPartitionCount()
+                    );
+                }
             } catch (IOException e) {
                 throw new RuntimeException("Failed to create log for partition " + i, e);
             }

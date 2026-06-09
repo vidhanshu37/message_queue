@@ -1,7 +1,7 @@
 package com.mq.controller;
 
-import com.mq.dto.CreateTopicRequest;
-import com.mq.dto.TopicResponse;
+import com.mq.dto.request.CreateTopicRequest;
+import com.mq.dto.response.TopicResponse;
 import com.mq.service.TopicService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;

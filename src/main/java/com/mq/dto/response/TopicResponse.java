@@ -1,10 +1,9 @@
-package com.mq.dto;
+package com.mq.dto.response;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
 
 import java.time.Instant;
-import java.time.LocalDateTime;
 
 @Data
 @AllArgsConstructor

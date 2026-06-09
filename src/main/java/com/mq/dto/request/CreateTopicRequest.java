@@ -1,4 +1,4 @@
-package com.mq.dto;
+package com.mq.dto.request;
 
 import jakarta.validation.constraints.*;
 import lombok.Data;
