@@ -65,6 +65,26 @@ public class LogManager {
     }
 
     /**
+     * Write message at specific offset
+     */
+    public void appendAtOffset(String topicName, int partitionIdx, byte[] payload, long offset) throws IOException {
+        String key = partitionKey(topicName, partitionIdx);
+        List<LogSegment> segments = partitionSegments.get(key);
+
+        if(segments == null) {
+            throw new IllegalArgumentException("Partition not initialized: " + key);
+        }
+
+        LogSegment active = activeSegment(segments);
+        if(active.isFull()) {
+            active = rollSegment(topicName, partitionIdx, segments);
+        }
+
+        // Write at the specific offset
+        active.appendAtOffset(payload, offset);
+    }
+
+    /**
      * Read messages from a partition starting at a given offset.
      */
     public List<MessageRecord> read(String topicName, int partitionIndex, long startOffset, int maxBytes) throws IOException {
