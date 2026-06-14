@@ -102,6 +102,26 @@ public class LogSegment implements Closeable {
     }
 
     /**
+     * write message at specific offset
+     */
+    public synchronized void appendAtOffset(byte[] payload, long offset) throws IOException {
+       long writePosition = writeChannel.size();
+
+       ByteBuffer buffer = ByteBuffer.allocate(8 + 4 + payload.length);
+       buffer.putLong(offset);
+       buffer.putInt(payload.length);
+       buffer.put(payload);
+       buffer.flip();
+
+       writeChannel.write(buffer);
+       offsetIndex.maybeRecord(offset, writePosition);
+
+       if(offset >= nextOffset) {
+           nextOffset = offset + 1;
+       }
+    }
+
+    /**
      * Read message starting at startOffset, up to maxBytes total
      * <p>
      * 1. Ask the index for the nearest file position <= startOffset

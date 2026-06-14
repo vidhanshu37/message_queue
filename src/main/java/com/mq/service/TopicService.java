@@ -46,17 +46,17 @@ public class TopicService {
         for(int i=0; i<request.getPartitionCount(); i++) {
             try {
                 logManager.initPartition(finalTopic.getName(), i);
-                if(brokerRegistry.getBrokerCount() > 0) {
-                    brokerRegistry.assignPartitions(
-                            request.getName(),
-                            request.getPartitionCount()
-                    );
-                }
+
             } catch (IOException e) {
                 throw new RuntimeException("Failed to create log for partition " + i, e);
             }
         }
-
+        if(brokerRegistry.getBrokerCount() > 0) {
+            brokerRegistry.assignPartitions(
+                    request.getName(),
+                    request.getPartitionCount()
+            );
+        }
         return toResponse(topic);
     }
 

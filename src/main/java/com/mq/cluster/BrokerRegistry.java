@@ -5,9 +5,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Optional;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Component
@@ -29,6 +28,23 @@ public class BrokerRegistry {
     public void registerBroker(BrokerInfo broker) {
         log.info("Registered Broker : {}", broker);
         hashRing.addBroker(broker);
+
+        // re-assign all existing partition so the new broker gets share
+        Map<String, BrokerInfo> allAssignments = partitionMetadata.getAllAssignments();
+        if (!allAssignments.isEmpty()) {
+            // Collect unique topic names from current assignments
+            Set<String> topics = allAssignments.keySet().stream()
+                    .map(key -> key.substring(0, key.lastIndexOf('-')))
+                    .collect(Collectors.toSet());
+
+            topics.forEach(topicName -> {
+                long partitionCount = allAssignments.keySet().stream()
+                        .filter(k -> k.startsWith(topicName + "-"))
+                        .count();
+                assignPartitions(topicName, (int) partitionCount);
+                log.info("Rebalanced topic '{}' after adding broker {}", topicName, broker.getBrokerId());
+            });
+        }
 
         log.info("Ring distribution after adding {} : {}", broker.getBrokerId(), hashRing.getDistribution());
     }
@@ -65,23 +81,52 @@ public class BrokerRegistry {
             return;
         }
 
+        // Step 1: initial assignment via consistent hashing (unchanged)
         for (int i = 0; i < partitionCount; i++) {
             String partitionKey = topicName + "-" + i;
-
             int finalI = i;
             hashRing.getBrokerForPartition(partitionKey)
-                    .ifPresent(brokerInfo -> {
-                        partitionMetadata.assignLeader(topicName, finalI, brokerInfo);
-                    });
+                    .ifPresent(brokerInfo -> partitionMetadata.assignLeader(topicName, finalI, brokerInfo));
+        }
+
+        // Step 2: rebalance — cap any broker at ceil(partitionCount / brokerCount)
+        int brokerCount = hashRing.getBrokerCount();
+        int maxPerBroker = (int) Math.ceil((double) partitionCount / brokerCount);
+
+        Map<String, Long> load = partitionMetadata.getTopicAssignment(topicName)
+                .values().stream()
+                .collect(Collectors.groupingBy(BrokerInfo::getBrokerId, Collectors.counting()));
+
+        // Find overloaded partitions and move them to underloaded brokers
+        List<BrokerInfo> allBrokers = new ArrayList<>(hashRing.getAllBrokers());
+        Map<Integer, BrokerInfo> assignments = partitionMetadata.getTopicAssignment(topicName);
+
+        for (Map.Entry<Integer, BrokerInfo> entry : assignments.entrySet()) {
+            int partIdx = entry.getKey();
+            BrokerInfo assigned = entry.getValue();
+            long assignedLoad = load.getOrDefault(assigned.getBrokerId(), 0L);
+
+            if (assignedLoad > maxPerBroker) {
+                // Find a broker under the max
+                Optional<BrokerInfo> underloaded = allBrokers.stream()
+                        .filter(b -> load.getOrDefault(b.getBrokerId(), 0L) < maxPerBroker)
+                        .findFirst();
+
+                if (underloaded.isPresent()) {
+                    BrokerInfo target = underloaded.get();
+                    partitionMetadata.assignLeader(topicName, partIdx, target);
+                    load.merge(assigned.getBrokerId(), -1L, Long::sum);
+                    load.merge(target.getBrokerId(), 1L, Long::sum);
+                    log.info("Rebalanced {}-{} from {} to {}", topicName, partIdx,
+                            assigned.getBrokerId(), target.getBrokerId());
+                }
+            }
         }
 
         log.info("Assigned {} partitions for topic '{}'", partitionCount, topicName);
-
-        // log final assignment
         partitionMetadata.getTopicAssignment(topicName)
-                .forEach((partition, broke) -> {
-                    log.info(" {}-{} -> {}", topicName, partition, broke.getBrokerId());
-                });
+                .forEach((partition, broker) ->
+                        log.info(" {}-{} -> {}", topicName, partition, broker.getBrokerId()));
     }
 
     /**

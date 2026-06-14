@@ -3,6 +3,8 @@ package com.mq.controller;
 import com.mq.cluster.BrokerRegistry;
 import com.mq.cluster.PartitionMetadata;
 import com.mq.model.BrokerInfo;
+import com.mq.replication.ReplicationService;
+import com.mq.storage.LogManager;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -19,6 +21,8 @@ import java.util.Map;
 public class BrokerController {
     private final BrokerRegistry brokerRegistry;
     private final PartitionMetadata partitionMetadata;
+    private final LogManager logManager;
+    private final ReplicationService replicationService;
 
     /**
      * Register broker with cluster
@@ -81,5 +85,22 @@ public class BrokerController {
                 "brokers", brokerRegistry.getAllBrokers(),
                 "count", brokerRegistry.getBrokerCount()
         ));
+    }
+
+    /**
+     * Get replication status for a partition
+     *
+     */
+    @GetMapping("/replication/{topic}/{partition}")
+    public ResponseEntity<?> getReplicationStatus(@PathVariable String topic, @PathVariable int partition) {
+        try {
+            long leaderOffset = logManager.getLatestOffset(topic, partition);
+            Map<String, Object> metrics = replicationService.getReplicationMetrics(topic, partition, leaderOffset);
+
+            return ResponseEntity.ok(metrics);
+        } catch (Exception e) {
+            return ResponseEntity.ok(Map.of(
+                    "error", e.getMessage()));
+        }
     }
 }
