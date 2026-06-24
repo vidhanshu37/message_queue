@@ -7,6 +7,7 @@ import com.mq.dto.response.RequestVoteResponse;
 import com.mq.raft.RaftNode;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -18,6 +19,9 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class RaftController {
     private final RaftNode raftNode;
+
+    @Value("${broker.id}")
+    private String currentBrokerId;
 
 
    //  RequestVote RPC — called by candidates during election
@@ -40,8 +44,7 @@ public class RaftController {
     @GetMapping("/state")
     public ResponseEntity<?> getState() {
         return ResponseEntity.ok(Map.of(
-                "brokerId", raftNode.getCurrentLeaderId() != null
-                    ? raftNode.getCurrentLeaderId() : "unknown",
+                "brokerId", currentBrokerId,
                 "state", raftNode.getState(),
                 "term", raftNode.getCurrentTerm(),
                 "isLeader", raftNode.isLeader(),

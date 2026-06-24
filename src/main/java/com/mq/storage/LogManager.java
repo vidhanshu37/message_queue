@@ -38,14 +38,16 @@ public class LogManager {
             return; // already initialized
         }
 
-        Path partitionDir = partitionDir(topicName, partitionIndex);
-        Files.createDirectories(partitionDir);
+        synchronized (this) {
+            Path partitionDir = partitionDir(topicName, partitionIndex);
+            Files.createDirectories(partitionDir);
 
-        List<LogSegment> segments = new ArrayList<>();
-        segments.add(createSegment(partitionDir, 0L));
-        partitionSegments.put(key, segments);
+            List<LogSegment> segments = new ArrayList<>();
+            segments.add(createSegment(partitionDir, 0L));
+            partitionSegments.put(key, segments);
 
-        log.info("Initialized partition {} with initial segment", key);
+            log.info("Initialized partition {} with initial segment", key);
+        }
     }
 
     /**
@@ -106,9 +108,10 @@ public class LogManager {
      * so, consumers will know how far behind they are
      */
     public long getLatestOffset(String topicName, int partitionIndex) throws IOException {
+        // Returns nextOffset — matches committedOffset convention (both point to next slot)
+        // lag = latestOffset - committedOffset = unconsumed message count
         List<LogSegment> segments = getSegments(topicName, partitionIndex);
-        long next = activeSegment(segments).getNextOffset();
-        return next == 0 ? 0 : next - 1;
+        return activeSegment(segments).getNextOffset();
     }
 
     ///  Helper function

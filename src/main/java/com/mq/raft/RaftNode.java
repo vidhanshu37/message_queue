@@ -7,17 +7,16 @@ import com.mq.dto.request.RequestVoteRequest;
 import com.mq.dto.response.HeartbeatResponse;
 import com.mq.dto.response.RequestVoteResponse;
 import com.mq.model.BrokerInfo;
+import com.mq.repository.TopicRepository;
 import com.mq.storage.LogManager;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import org.hibernate.annotations.Collate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -28,60 +27,34 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Component
 public class RaftNode {
 
-    // in production raft written on disk but for now use in-memory
-
-    /**
-     * Current term — the logical clock.
-     * Incremented on every election start.
-     */
-    private final AtomicInteger currentTerm = new AtomicInteger(0); // thread-safe
-
-    /**
-     * who this node voted for in current term
-     * volatile - Whenever a thread reads this variable, always read the latest value from main memory. Don't use a cached copy
-     */
+    // ── Persistent Raft state ────────────────────────────────────────────────
+    private final AtomicInteger currentTerm = new AtomicInteger(0);
     private volatile String votedFor = null;
 
-    // RAFT volatile state bcz - read by multiple threads and written by election logic
-    @Getter
-    private volatile RaftState state = RaftState.FOLLOWER;
+    // ── Volatile Raft state ──────────────────────────────────────────────────
+    @Getter private volatile RaftState state = RaftState.FOLLOWER;
+    @Getter private volatile String currentLeaderId = null;
 
-    // leader id -> if null no leader yet
-    @Getter
-    private volatile String currentLeaderId = null;
+    // ── Election timing ──────────────────────────────────────────────────────
+    private volatile long lastHeartbeatTime;
+    private volatile long electionDeadline;
 
-    // last time received heartbeat from leader
-    private volatile long lastHeartbeatTime = System.currentTimeMillis();
+    private static final int ELECTION_TIMEOUT_MIN_MS = 300;
+    private static final int ELECTION_TIMEOUT_MAX_MS = 700;
+    private static final int HEARTBEAT_INTERVAL_MS   = 50;
 
-
-    /// ELECTION TIMEOUT CONFIG
-
-    /**
-     * If no heartbeat received within a random value
-     * between MIN and MAX, start an election.
-     * <p>
-     * 150ms min -> must be > heartbeat interval(150 ms) to avoid false elections during operation
-     * <p>
-     * and choose random time - prevents all followers timing out simultaneously that's why we use random timeout
-     */
-    private static final int ELECTION_TIMEOUT_MIN_MS = 150;
-    private static final int ELECTION_TIMEOUT_MAX_MS = 300;
-
-    private static final int HEARTBEAT_INTERVAL_MS = 50; // leader sends heartbeat every 50ms
-
-    ///  DEPENDENCY
-    private final BrokerRegistry brokerRegistry;
+    // ── Dependencies ─────────────────────────────────────────────────────────
+    private final BrokerRegistry    brokerRegistry;
     private final PartitionMetadata partitionMetadata;
-    private final LogManager logManager;
-    private final RestTemplate restTemplate;
-    private final Random random = new Random();
+    private final LogManager        logManager;
+    private final TopicRepository   topicRepository;
+    private final RestTemplate      restTemplate;
+    private final Random            random = new Random();
 
     @Value("${broker.id:broker-1}")
     private String currentBrokerId;
 
-    ///  BACKGROUND THREADS
-    // use single thread for election
-
+    // ── Background threads ───────────────────────────────────────────────────
     private final ScheduledExecutorService electionExecutor =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "raft-election");
@@ -89,9 +62,6 @@ public class RaftNode {
                 return t;
             });
 
-    /**
-     * leader send heartbeats independently of the election time out checker - create separate executor
-     */
     private final ScheduledExecutorService heartbeatExecutor =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "raft-heartbeat");
@@ -102,44 +72,30 @@ public class RaftNode {
     public RaftNode(BrokerRegistry brokerRegistry,
                     PartitionMetadata partitionMetadata,
                     LogManager logManager,
+                    TopicRepository topicRepository,
                     RestTemplate restTemplate) {
-        this.brokerRegistry = brokerRegistry;
+        this.brokerRegistry    = brokerRegistry;
         this.partitionMetadata = partitionMetadata;
-        this.logManager = logManager;
-        this.restTemplate = restTemplate;
+        this.logManager        = logManager;
+        this.topicRepository   = topicRepository;
+        this.restTemplate      = restTemplate;
     }
 
-    ///  LIFECYCLE
+    // ── Lifecycle ────────────────────────────────────────────────────────────
 
-    /**
-     * Start background threads for election and heartbeat after spring context  initialized
-     */
     @PostConstruct
     public void start() {
         log.info("Starting RaftNode with brokerId {} in state {}", currentBrokerId, state);
-
-        // start election timeout checker
-        // runs every 10ms to check if timeout has elapsed
-
-        int startupDelayMs = 2000;
+        resetElectionDeadline(2000); // 2 s startup grace period
 
         electionExecutor.scheduleAtFixedRate(
-                this::checkElectionTimeout,
-                startupDelayMs, //getRandomElectionTimeout(),
-                10, //  check every 10 ms
-                java.util.concurrent.TimeUnit.MILLISECONDS
-        );
+                this::checkElectionTimeout, 2000, 10, TimeUnit.MILLISECONDS);
 
-        // Start heartbeat sender
-        // Only actually sends if this node is LEADER
         heartbeatExecutor.scheduleAtFixedRate(
                 this::maybeSendHeartbeats,
-                startupDelayMs + HEARTBEAT_INTERVAL_MS,
+                2000 + HEARTBEAT_INTERVAL_MS,
                 HEARTBEAT_INTERVAL_MS,
-                TimeUnit.MILLISECONDS
-        );
-
-        lastHeartbeatTime = System.currentTimeMillis() + startupDelayMs;
+                TimeUnit.MILLISECONDS);
 
         log.info("RaftNode started. Initial state: {}, initial term: {}, initial leader: {}",
                 state, currentTerm.get(), currentLeaderId);
@@ -152,158 +108,144 @@ public class RaftNode {
         log.info("RaftNode stopped");
     }
 
-    ///  ELECTION timeout logic
+    // ── Election timeout ─────────────────────────────────────────────────────
 
-    /**
-     * called every 10ms by the election timer
-     * check if gone too long without heartbeat
-     * <p>
-     * only FOLLOWER and CANDIDATE check for time out
-     */
     private void checkElectionTimeout() {
-        // LEADER don't need to check for timeout
-        if (state == RaftState.LEADER) {
-            return;
-        }
-
-        long elapsed = System.currentTimeMillis() - lastHeartbeatTime;
-        long timeout = getRandomElectionTimeout();
-
-        if (elapsed > timeout) {
-            log.info("Election timeout! No heartbeat for {}ms. " +
-                            "Starting election. Term: {}",
+        if (state == RaftState.LEADER) return;
+        long now = System.currentTimeMillis();
+        if (now >= electionDeadline) {
+            long elapsed = now - lastHeartbeatTime;
+            log.info("Election timeout! No heartbeat for {}ms. Starting election. Term: {}",
                     elapsed, currentTerm.get());
             startElection();
         }
-
     }
 
-    /**
-     * Get random election timeout btw MIN and MAX
-     *
-     */
-    private long getRandomElectionTimeout() {
-        return ELECTION_TIMEOUT_MIN_MS + random.nextInt(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS);
+    /** Reset both the heartbeat timestamp and the fixed election deadline. */
+    private void resetElectionDeadline() {
+        long now = System.currentTimeMillis();
+        lastHeartbeatTime = now;
+        long timeout = ELECTION_TIMEOUT_MIN_MS
+                + random.nextInt(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS);
+        electionDeadline = now + timeout;
     }
 
-    ///  ELECTION logic
+    private void resetElectionDeadline(int extraDelayMs) {
+        long now = System.currentTimeMillis();
+        lastHeartbeatTime = now;
+        long timeout = ELECTION_TIMEOUT_MIN_MS
+                + random.nextInt(ELECTION_TIMEOUT_MAX_MS - ELECTION_TIMEOUT_MIN_MS);
+        electionDeadline = now + extraDelayMs + timeout;
+    }
+
+    // ── Election logic ───────────────────────────────────────────────────────
 
     /**
-     * Start new election
-     * <p>
-     * 1. become a candidate
-     * 2. increment term
-     * 3. vote for self
-     * 4. send request-vote
-     * 5. if majority votes -> be leader
-     * 6. if see higher term -> step down to follower
-     * 7. if no majority then wait for next timeout
+     * Three-phase election:
+     *   Phase 1 (locked)   – become CANDIDATE, bump term, self-vote
+     *   Phase 2 (no lock)  – collect votes via HTTP (lock-free so heartbeats can still land)
+     *   Phase 3 (locked)   – evaluate result; become LEADER or revert to FOLLOWER
      */
+    private void startElection() {
+        // ── Phase 1 ──────────────────────────────────────────────────────────
+        final int newTerm;
+        final List<BrokerInfo> peers;
+        final int majority;
 
-    private synchronized void startElection() {
-        state = RaftState.CANDIDATE;
-        int newTerm = currentTerm.incrementAndGet(); // increment term atomically
-        votedFor = currentBrokerId; // vote for self
-        currentLeaderId = null;
+        synchronized (this) {
+            if (state == RaftState.LEADER)    return;
+            if (state == RaftState.CANDIDATE) return; // already mid-election
 
-        log.info("Started election for term {}. Voted for self. State: {}", newTerm, state);
+            state        = RaftState.CANDIDATE;
+            newTerm      = currentTerm.incrementAndGet();
+            votedFor     = currentBrokerId;
+            currentLeaderId = null;
+            resetElectionDeadline();
 
-        Collection<BrokerInfo> peers = brokerRegistry.getAllBrokers()
-                .stream()
-                .filter(b -> !b.getBrokerId().equals(currentBrokerId)) // exclude self
-                .toList();
+            log.info("Started election for term {}. Voted for self.", newTerm);
 
-        if(peers.isEmpty()) {
-            // Single node - immediately win
-            log.info("No peers found — single node, becoming leader");
-            becomeLeader(newTerm);
-            return;
+            peers = brokerRegistry.getAllBrokers().stream()
+                    .filter(b -> !b.getBrokerId().equals(currentBrokerId))
+                    .toList();
+
+            if (peers.isEmpty()) {
+                becomeLeader(newTerm);
+                return;
+            }
+
+            int totalNodes = peers.size() + 1;
+            majority = (totalNodes / 2) + 1;
         }
 
-        // count votes
-        AtomicInteger voteCount = new AtomicInteger(1); // start with 1 vote for self
-        int majority = (brokerRegistry.getBrokerCount() / 2) + 1;
+        // ── Phase 2 (lock-free) ───────────────────────────────────────────────
+        AtomicInteger voteCount = new AtomicInteger(1); // self-vote
 
-        // send request vote to all peers
         List<CompletableFuture<Void>> futures = peers.stream()
                 .map(peer -> requestVoteFrom(peer, newTerm, voteCount, majority))
                 .toList();
 
-        // wait for all votes with timeout
-        CompletableFuture<Void> allVotes = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
-
         try {
-            allVotes.get(ELECTION_TIMEOUT_MAX_MS, TimeUnit.MILLISECONDS);
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(ELECTION_TIMEOUT_MAX_MS, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             log.warn("Vote collection timed out for term {}", newTerm);
         } catch (Exception e) {
-            log.warn("Vote collection error: {}", e.getMessage());
+            log.warn("Vote collection error for term {}: {}", newTerm, e.getMessage());
         }
 
-        // check final result
-        if(state == RaftState.CANDIDATE && voteCount.get() >= majority) {
-            becomeLeader(newTerm);
-        } else {
-            log.info("Election failed for term {}. Got {}/{} votes. " +
-                            "Reverting to follower.",
-                    newTerm, voteCount.get(), majority);
-            state = RaftState.FOLLOWER;
+        // ── Phase 3 ──────────────────────────────────────────────────────────
+        synchronized (this) {
+            if (state != RaftState.CANDIDATE) {
+                log.info("Election for term {} cancelled — state is now {}", newTerm, state);
+                return;
+            }
+            if (currentTerm.get() != newTerm) {
+                log.info("Election for term {} stale — current term is {}", newTerm, currentTerm.get());
+                state = RaftState.FOLLOWER;
+                resetElectionDeadline();
+                return;
+            }
+            if (voteCount.get() >= majority) {
+                becomeLeader(newTerm);
+            } else {
+                log.info("Lost election for term {}. Got {}/{} votes.", newTerm, voteCount.get(), majority);
+                state = RaftState.FOLLOWER;
+                resetElectionDeadline();
+            }
         }
     }
 
-    // send requestVote
-    private CompletableFuture<Void> requestVoteFrom(BrokerInfo peer, int term, AtomicInteger voteCount, int majority) {
+    private CompletableFuture<Void> requestVoteFrom(BrokerInfo peer, int term,
+                                                    AtomicInteger voteCount, int majority) {
         return CompletableFuture.runAsync(() -> {
             try {
-               // get latest log offset - ensure up-to-date
-                long lastLogOffset = getLatestLogOffset();
-
                 RequestVoteRequest request = new RequestVoteRequest(
-                        term,
-                        currentBrokerId,
-                        lastLogOffset,
-                        "cluster", // global election
-                        -1
-                );
+                        term, currentBrokerId, getLatestLogOffset(), "cluster", -1);
 
-                String url = peer.baseUrl() + "/api/v1/raft/vote";
+                RequestVoteResponse response = restTemplate.postForObject(
+                        peer.baseUrl() + "/api/v1/raft/vote",
+                        request, RequestVoteResponse.class);
 
-                RequestVoteResponse response = restTemplate.postForObject(url, request, RequestVoteResponse.class);
+                if (response == null) return;
 
-                if(response == null) return;
-
-                // if peer has higher term: revert to follower
-                if(response.getTerm() > currentTerm.get()) {
-                    log.info("Peer {} has higher term {}. " +
-                                    "Reverting to follower.",
-                            peer.getBrokerId(), response.getTerm());
+                if (response.getTerm() > currentTerm.get()) {
                     becomeFollower(response.getTerm(), null);
                     return;
                 }
 
-                // count the vote
-                if(response.isVoteGranted()) {
+                if (response.isVoteGranted()) {
                     int votes = voteCount.incrementAndGet();
                     log.info("Received vote from {} for term {}. Total votes: {}/{}",
                             peer.getBrokerId(), term, votes, majority);
                 }
-
             } catch (Exception e) {
                 log.warn("Error requesting vote from {}: {}", peer.getBrokerId(), e.getMessage());
             }
         });
     }
 
-    /// Vote granting logic - receiver side
+    // ── Vote-granting (receiver side) ────────────────────────────────────────
 
-    /**
-     * Grant vote - if all conditions are true
-     * 1. candidate's term >= our term
-     * 2. we haven't voted for someone else for this term
-     * 3. candidate's log is at least as up-to-date as ours
-     *
-     * and ensure elected leader has all committed data
-     */
     public synchronized RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
         int candidateTerm = request.getTerm();
         String candidateId = request.getCandidateId();
@@ -311,246 +253,158 @@ public class RaftNode {
         log.info("Received RequestVote from {} for term {}. Current term: {}, votedFor: {}, state: {}",
                 candidateId, candidateTerm, currentTerm.get(), votedFor, state);
 
-        // Rule 1 : if candidate's term < current term, reject
-        if(candidateTerm < currentTerm.get()) {
-            log.info("Rejecting vote for {} because candidate term {} is less than current term {}",
-                    candidateId, candidateTerm, currentTerm.get());
+        if (candidateTerm < currentTerm.get()) {
             return new RequestVoteResponse(currentTerm.get(), false, currentBrokerId);
         }
 
-        //If candidate has higher term: update our term, revert to follower, clear our vote
-        if(candidateTerm > currentTerm.get()) {
+        if (candidateTerm > currentTerm.get()) {
             becomeFollower(candidateTerm, null);
         }
 
-        // Rule 2: if we already voted for someone else in this term, reject
-        boolean canVote = (votedFor == null || votedFor.equals(candidateId));
+        boolean canVote    = (votedFor == null || votedFor.equals(candidateId));
+        boolean logOk      = request.getLastLogOffset() >= getLatestLogOffset();
 
-        // RUle 3: is candidate's log at least as up-to-date
-        long ourLatestOffset = getLatestLogOffset();
-        boolean logUptoDate = request.getLastLogOffset() >= ourLatestOffset;
-
-        if(canVote && logUptoDate) {
-            // Grant vote
+        if (canVote && logOk) {
             votedFor = candidateId;
-            // Reset election timer — we just heard from a valid candidate
-            lastHeartbeatTime = System.currentTimeMillis();
-
-            log.info("Granted vote to {} for term {}",
-                    candidateId, candidateTerm);
-            return new RequestVoteResponse(
-                    currentTerm.get(), true, currentBrokerId);
+            resetElectionDeadline();
+            log.info("Granted vote to {} for term {}", candidateId, candidateTerm);
+            return new RequestVoteResponse(currentTerm.get(), true, currentBrokerId);
         }
 
-        log.info("Denied vote to {}. canVote={}, logUpToDate={}, " +
-                        "votedFor={}, ourOffset={}, candidateOffset={}",
-                candidateId, canVote, logUptoDate,
-                votedFor, ourLatestOffset,
-                request.getLastLogOffset());
-
-        return new RequestVoteResponse(
-                currentTerm.get(), false, currentBrokerId);
+        log.info("Denied vote to {}. canVote={}, logUpToDate={}, votedFor={}, ourOffset={}, candidateOffset={}",
+                candidateId, canVote, logOk, votedFor, getLatestLogOffset(), request.getLastLogOffset());
+        return new RequestVoteResponse(currentTerm.get(), false, currentBrokerId);
     }
 
-    ///  Heartbeat logic
+    // ── Heartbeat ────────────────────────────────────────────────────────────
 
-    /**
-     * Send heartbeat to all followers
-     *
-     * 2 purpose
-     *  - leader is alive don't do election
-     *  - tell follower who is current leader
-     */
     private void maybeSendHeartbeats() {
-        if (state != RaftState.LEADER) {
-            return;
-        }
+        if (state != RaftState.LEADER) return;
         brokerRegistry.getAllBrokers().stream()
-                .filter(b -> !b.getBrokerId().equals(currentBrokerId)) // exclude self
+                .filter(b -> !b.getBrokerId().equals(currentBrokerId))
                 .forEach(this::sendHeartBeatTo);
     }
 
     private void sendHeartBeatTo(BrokerInfo peer) {
         try {
             HeartbeatRequest request = new HeartbeatRequest(
-                    currentTerm.get(),
-                    currentBrokerId,
-                    "cluster", // global heartbeat
-                    -1,
-                    getLatestLogOffset()
-            );
+                    currentTerm.get(), currentBrokerId, "cluster", -1, getLatestLogOffset());
 
-            String url = peer.baseUrl() + "/api/v1/raft/heartbeat";
+            HeartbeatResponse response = restTemplate.postForObject(
+                    peer.baseUrl() + "/api/v1/raft/heartbeat",
+                    request, HeartbeatResponse.class);
 
-            HeartbeatResponse response = restTemplate.postForObject(url, request, HeartbeatResponse.class);
-
-            if(response != null && response.getTerm() > currentTerm.get()) {
-                // Peer has higher term — we're a stale leader
-                // Step down immediately
-                log.info("Stepping down: peer {} has higher term {}",
-                        peer.getBrokerId(), response.getTerm());
+            if (response != null && response.getTerm() > currentTerm.get()) {
+                log.info("Stepping down: peer {} has higher term {}", peer.getBrokerId(), response.getTerm());
                 becomeFollower(response.getTerm(), null);
             }
         } catch (Exception e) {
-            log.debug("Heartbeat to {} failed: {}",
-                    peer.getBrokerId(), e.getMessage());
+            // FIX: catch here so one failed peer does NOT kill the heartbeat loop
+            log.debug("Heartbeat to {} failed: {}", peer.getBrokerId(), e.getMessage());
         }
     }
 
-    /**
-     * handle incoming heartbeat from leader
-     *
-     * heartbeat reset our election timer
-     */
     public synchronized HeartbeatResponse handleHeartBeat(HeartbeatRequest request) {
         int leaderTerm = request.getTerm();
 
-        // reject heartbeat from stale leader
-        if(leaderTerm < currentTerm.get()) {
-            log.warn("Rejecting heartbeat from stale leader {} " +
-                            "(term {} < our term {})",
-                    request.getLeaderId(),
-                    leaderTerm, currentTerm.get());
-            return new HeartbeatResponse(
-                    currentTerm.get(), false, currentBrokerId);
+        if (leaderTerm < currentTerm.get()) {
+            log.warn("Rejecting heartbeat from stale leader {} (term {} < our term {})",
+                    request.getLeaderId(), leaderTerm, currentTerm.get());
+            return new HeartbeatResponse(currentTerm.get(), false, currentBrokerId);
         }
 
-        // valid heartbeat
-        if(leaderTerm > currentTerm.get()) {
+        if (leaderTerm > currentTerm.get()) {
             currentTerm.set(leaderTerm);
             votedFor = null;
         }
 
-        // stepping down if we were a candidate or leader
-        if(state != RaftState.FOLLOWER) {
-            log.info("Stepping down to FOLLOWER. " +
-                            "Received heartbeat from leader {} (term {})",
+        if (state != RaftState.FOLLOWER) {
+            log.info("Stepping down to FOLLOWER. Received heartbeat from leader {} (term {})",
                     request.getLeaderId(), leaderTerm);
             state = RaftState.FOLLOWER;
         }
 
-        // reset election timer
-        lastHeartbeatTime = System.currentTimeMillis();
         currentLeaderId = request.getLeaderId();
+        // FIX: use resetElectionDeadline() — updates BOTH lastHeartbeatTime AND electionDeadline
+        resetElectionDeadline();
 
-        // Update partition metadata with current leader
-        // So producers know where to send messages
-        if (request.getPartitionIdx() >= 0) {
-            brokerRegistry.getAllBrokers().stream()
-                    .filter(b -> b.getBrokerId()
-                            .equals(request.getLeaderId()))
-                    .findFirst()
-                    .ifPresent(leader ->
-                            partitionMetadata.assignLeader(
-                                    request.getTopicName(),
-                                    request.getPartitionIdx(),
-                                    leader));
-        }
-
-        return new HeartbeatResponse(
-                currentTerm.get(), true, currentBrokerId);
+        return new HeartbeatResponse(currentTerm.get(), true, currentBrokerId);
     }
 
-    ///  STATE TRANSITION HELPERS
+    // ── State transitions ────────────────────────────────────────────────────
 
-    /**
-     * transition to leader state
-     *
-     * 1. update local state
-     * 2. update partition metadata so producers route here
-     * 3. start sending heartbeats immediately
-     */
-    private synchronized void becomeLeader(int term) {
-        state = RaftState.LEADER;
+    /** Must be called while holding the monitor. */
+    private void becomeLeader(int term) {
+        state           = RaftState.LEADER;
         currentLeaderId = currentBrokerId;
         log.info("||  BECAME LEADER for term {}   ||", term);
 
-        // Update ALL partition assignments to point to this broker
-        // In a full Raft implementation, you'd only take over
-        // partitions you were previously assigned.
-        // For simplicity: new leader takes all partitions.
-        BrokerInfo selfInfo = brokerRegistry.getAllBrokers()
-                .stream()
-                .filter(b -> b.getBrokerId().equals(currentBrokerId))
-                .findFirst()
-                .orElse(null);
+        /**
+         * FIX (Bug 2 — PartitionMetadata lost on leader change):
+         *
+         * When a new Raft leader is elected, PartitionMetadata (which broker owns which
+         * partition) is in-memory only — it was built by the OLD leader during topic creation
+         * and lives only in that process. The new leader's PartitionMetadata is empty.
+         *
+         * Fix: re-run assignPartitions() for every topic immediately on becoming leader.
+         * This rebuilds the routing table from the consistent hash ring (which IS
+         * deterministic — same brokers → same assignments every time).
+         *
+         * This is exactly what Kafka's controller does: on controller failover, the new
+         * controller reads ZooKeeper and rebuilds all partition state from scratch.
+         */
+        try {
+            List<String> topicNames = topicRepository.findAll()
+                    .stream().map(t -> t.getName()).toList();
 
-        if (selfInfo != null) {
-            partitionMetadata.getAllAssignments()
-                    .keySet()
-                    .forEach(partitionKey -> {
-                        // Parse "topicName-partitionIndex"
-                        int lastDash = partitionKey.lastIndexOf('-');
-                        if (lastDash > 0) {
-                            String topic = partitionKey
-                                    .substring(0, lastDash);
-                            int partition = Integer.parseInt(
-                                    partitionKey.substring(lastDash + 1));
-                            partitionMetadata.assignLeader(
-                                    topic, partition, selfInfo);
-                        }
-                    });
+            for (String topicName : topicNames) {
+                // findByName gives us partitionCount
+                topicRepository.findByName(topicName).ifPresent(topic -> {
+                    brokerRegistry.assignPartitions(topicName, topic.getPartitionCount());
+                    log.info("Re-assigned {} partitions for topic '{}' after leader election",
+                            topic.getPartitionCount(), topicName);
+                });
+            }
+        } catch (Exception e) {
+            log.error("Failed to re-assign partitions after leader election: {}", e.getMessage());
         }
 
-        // Send immediate heartbeat to suppress other elections
+        // Send heartbeats immediately to suppress follower elections
         maybeSendHeartbeats();
     }
 
-    /**
-     * Transition to FOLLOWER state.
-     * Called when we see a higher term or lose an election.
-     */
     private synchronized void becomeFollower(int term, String leaderId) {
-        state = RaftState.FOLLOWER;
+        state           = RaftState.FOLLOWER;
         currentTerm.set(term);
-        votedFor = null;
+        votedFor        = null;
         currentLeaderId = leaderId;
-        lastHeartbeatTime = System.currentTimeMillis();
-
+        resetElectionDeadline();
         log.info("Became FOLLOWER for term {}. Leader: {}", term, leaderId);
     }
 
-    /// HELPER FUNCTION
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
     private long getLatestLogOffset() {
-        long maxOffset = 0;
+        long max = 0;
         try {
-            for (Map.Entry<String, BrokerInfo> entry :
-                    partitionMetadata.getAllAssignments().entrySet()) {
-
-                String partitionKey = entry.getKey();
-                int lastDash = partitionKey.lastIndexOf('-');
+            for (Map.Entry<String, BrokerInfo> entry : partitionMetadata.getAllAssignments().entrySet()) {
+                String key = entry.getKey();
+                int lastDash = key.lastIndexOf('-');
                 if (lastDash <= 0) continue;
-
-                String topic = partitionKey.substring(0, lastDash);
-                int partition = Integer.parseInt(
-                        partitionKey.substring(lastDash + 1));
-
                 try {
-                    long offset = logManager
-                            .getLatestOffset(topic, partition);
-                    maxOffset = Math.max(maxOffset, offset);
+                    long off = logManager.getLatestOffset(
+                            key.substring(0, lastDash),
+                            Integer.parseInt(key.substring(lastDash + 1)));
+                    max = Math.max(max, off);
                 } catch (Exception ignored) {}
             }
         } catch (Exception e) {
             log.debug("Error getting log offset: {}", e.getMessage());
         }
-        return maxOffset;
+        return max;
     }
 
-    public int getCurrentTerm() {
-        return currentTerm.get();
-    }
-
-    public boolean isLeader() {
-        return state == RaftState.LEADER;
-    }
-
-    /**
-     * Called when this broker receives a valid heartbeat.
-     * Resets the election timer.
-     * Public so RaftController can call it.
-     */
-    public void resetElectionTimer() {
-        lastHeartbeatTime = System.currentTimeMillis();
-    }
+    public int getCurrentTerm()  { return currentTerm.get(); }
+    public boolean isLeader()    { return state == RaftState.LEADER; }
+    public void resetElectionTimer() { resetElectionDeadline(); }
 }
