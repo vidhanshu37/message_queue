@@ -41,6 +41,11 @@ public class ConsistentHashRing {
      * "i#" suffix ensures each virtual node lands
      */
     public void addBroker(BrokerInfo broker) {
+        // IDEMPOTENCY GUARD — skip if already registered
+        if (registeredBrokers.containsKey(broker.getBrokerId())) {
+            log.debug("Broker {} already in ring, skipping duplicate add", broker.getBrokerId());
+            return;
+        }
         registeredBrokers.put(broker.getBrokerId(), broker);
 
         for (int i = 0; i < VIRTUAL_NODES_PER_BROKER; i++) {

@@ -29,24 +29,8 @@ public class BrokerRegistry {
         log.info("Registered Broker : {}", broker);
         hashRing.addBroker(broker);
 
-        // re-assign all existing partition so the new broker gets share
-        Map<String, BrokerInfo> allAssignments = partitionMetadata.getAllAssignments();
-        if (!allAssignments.isEmpty()) {
-            // Collect unique topic names from current assignments
-            Set<String> topics = allAssignments.keySet().stream()
-                    .map(key -> key.substring(0, key.lastIndexOf('-')))
-                    .collect(Collectors.toSet());
-
-            topics.forEach(topicName -> {
-                long partitionCount = allAssignments.keySet().stream()
-                        .filter(k -> k.startsWith(topicName + "-"))
-                        .count();
-                assignPartitions(topicName, (int) partitionCount);
-                log.info("Rebalanced topic '{}' after adding broker {}", topicName, broker.getBrokerId());
-            });
-        }
-
-        log.info("Ring distribution after adding {} : {}", broker.getBrokerId(), hashRing.getDistribution());
+        log.info("Ring distribution after adding {} : {}",
+                broker.getBrokerId(), hashRing.getDistribution());
     }
 
     /**

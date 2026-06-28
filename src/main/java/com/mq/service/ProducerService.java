@@ -4,6 +4,7 @@ import com.mq.dto.request.ProduceRequest;
 import com.mq.dto.response.ProduceResponse;
 import com.mq.exception.TopicNotFoundException;
 import com.mq.model.Topic;
+import com.mq.raft.RaftNode;
 import com.mq.replication.ReplicationService;
 import com.mq.repository.TopicRepository;
 import com.mq.storage.LogManager;
@@ -22,6 +23,7 @@ public class ProducerService {
     private final LogManager logManager;
     private final PartitionSelector partitionSelector;
     private final ReplicationService replicationService;
+    private final RaftNode raftNode;
 
     /**
      * Core operation by producer service

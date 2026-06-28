@@ -1,5 +1,7 @@
 package com.mq.controller;
 
+import com.mq.cluster.BrokerRegistry;
+import com.mq.cluster.PartitionMetadata;
 import com.mq.dto.request.ReplicateRequest;
 import com.mq.dto.response.ReplicateResponse;
 import com.mq.storage.LogManager;
@@ -21,31 +23,31 @@ import java.util.Map;
 public class ReplicationController {
 
     private final LogManager logManager;
+    private final PartitionMetadata partitionMetadata;
+    private final BrokerRegistry brokerRegistry;
 
     @Value("${broker.id:broker-1}")
     private String currentBrokerId;
 
     /**
-     * Received replication message from leader
-     * <p>
-     * this is gonna call by leader's replicationService
-     * followers must do :
-     * 1. decode payload
-     * 2. write to its own log at exact same offset
-     * 3. return success/failure
+     * Receive a replicated message from the Raft leader.
+     *
+     * Steps:
+     *  1. Decode Base64 payload
+     *  2. Init the partition log if not already done (idempotent)
+     *  3. Write to local log at the exact same offset the leader assigned
+     *  4. Return success/failure
      */
     @PostMapping("/replicate")
     public ResponseEntity<ReplicateResponse> replicate(@RequestBody ReplicateRequest request) {
         try {
-            // step1 - decode payload (base64 -> byte)
+            // Step 1 – decode payload
             byte[] payload = Base64.getDecoder().decode(request.getPayloadBase64());
 
-            // step2 - write to log at the same offset
-            logManager.initPartition(
-                    request.getTopicName(),
-                    request.getPartitionIdx()
-            );
+            // Step 2 – make sure partition log exists (idempotent)
+            logManager.initPartition(request.getTopicName(), request.getPartitionIdx());
 
+            // Step 3 – write at the leader-assigned offset
             logManager.appendAtOffset(
                     request.getTopicName(),
                     request.getPartitionIdx(),
@@ -53,29 +55,34 @@ public class ReplicationController {
                     request.getOffset()
             );
 
+            // FIX: update this follower's partition metadata so it knows
+            // who the leader is.  The sender of the replicate request IS the
+            // current leader for this partition.
+            if (request.getLeaderId() != null) {
+                brokerRegistry.getAllBrokers().stream()
+                        .filter(b -> b.getBrokerId().equals(request.getLeaderId()))
+                        .findFirst()
+                        .ifPresent(leaderInfo ->
+                                partitionMetadata.assignLeader(
+                                        request.getTopicName(),
+                                        request.getPartitionIdx(),
+                                        leaderInfo));
+            }
+
             log.debug("Replicated {}-{} offset {} on follower {}",
-                    request.getTopicName(), request.getPartitionIdx(), request.getOffset(), currentBrokerId);
+                    request.getTopicName(), request.getPartitionIdx(),
+                    request.getOffset(), currentBrokerId);
 
             return ResponseEntity.ok(new ReplicateResponse(
-                    true, currentBrokerId, request.getOffset(), "Replicated successfully"
-            ));
+                    true, currentBrokerId, request.getOffset(), "Replicated successfully"));
 
         } catch (IOException e) {
-            log.error("Replication failed on follower {}: {}",
-                    currentBrokerId, e.getMessage());
-
+            log.error("Replication failed on follower {}: {}", currentBrokerId, e.getMessage());
             return ResponseEntity.ok(new ReplicateResponse(
-                    false,
-                    currentBrokerId,
-                    -1,
-                    "Replication failed: " + e.getMessage()
-            ));
+                    false, currentBrokerId, -1, "Replication failed: " + e.getMessage()));
         }
     }
 
-    /**
-     * Get replication health
-     */
     @GetMapping("/health")
     public ResponseEntity<?> replicationHealth() {
         return ResponseEntity.ok(Map.of(
@@ -85,5 +92,24 @@ public class ReplicationController {
         ));
     }
 
+    @PostMapping("/init-partition")
+    public ResponseEntity<?> initPartition(@RequestBody Map<String, Object> request) {
+        try {
+            String topicName   = (String) request.get("topicName");
+            int partitionIndex = (Integer) request.get("partitionIndex");
 
+            logManager.initPartition(topicName, partitionIndex);
+            log.info("Partition {}-{} initialized on follower {}", topicName, partitionIndex, currentBrokerId);
+
+            return ResponseEntity.ok(Map.of(
+                    "status", "initialized",
+                    "topicName", topicName,
+                    "partitionIndex", partitionIndex,
+                    "brokerId", currentBrokerId
+            ));
+        } catch (IOException e) {
+            log.error("Failed to init partition: {}", e.getMessage());
+            return ResponseEntity.internalServerError().body(Map.of("error", e.getMessage()));
+        }
+    }
 }

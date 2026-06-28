@@ -66,75 +66,48 @@ public class ReplicationService {
                                           byte[] payload,
                                           long offset) {
 
-        // Check if THIS broker is the leader for this partition
-        Optional<BrokerInfo> leaderOpt =
-                partitionMetadata.getLeader(topicName, partitionIndex);
-
-        if (leaderOpt.isEmpty()) {
-            log.debug("No leader assigned for {}-{}, skipping replication",
-                    topicName, partitionIndex);
-            return true;
-        }
-
-        String leaderId = leaderOpt.get().getBrokerId();
-
-        // CRITICAL CHECK: Only replicate if WE are the leader
-        // If we are not the leader, skip replication entirely
-        // (the actual leader will handle it)
-        if (!leaderId.equals(currentBrokerId)) {
-            log.debug("This broker ({}) is not the leader ({}) for {}-{}. " +
-                            "Skipping replication.",
-                    currentBrokerId, leaderId, topicName, partitionIndex);
-            return true;
-        }
-
-        // We ARE the leader — replicate to all OTHER brokers
+        // ProducerService only calls this when Raft leader writes
         List<BrokerInfo> followers = brokerRegistry.getAllBrokers()
                 .stream()
                 .filter(b -> !b.getBrokerId().equals(currentBrokerId))
                 .collect(Collectors.toList());
 
         if (followers.isEmpty()) {
-            log.debug("No followers available, single-node mode");
+            log.debug("No followers — single node mode");
             return true;
         }
 
-        // Build replication request
         ReplicateRequest request = new ReplicateRequest(
                 topicName,
                 partitionIndex,
                 Base64.getEncoder().encodeToString(payload),
-                offset
+                offset,
+                currentBrokerId   // FIX: tell followers who the leader is
         );
 
-        // Send to all followers in parallel
         List<CompletableFuture<Boolean>> futures = followers.stream()
                 .map(follower -> replicateToOne(follower, request))
                 .collect(Collectors.toList());
 
-        int successCount = 1; // leader itself = 1
+        int successCount = 1; // leader counts as 1
 
         for (CompletableFuture<Boolean> future : futures) {
             try {
-                boolean success = future.get(
-                        replicationTimeoutMs, TimeUnit.MILLISECONDS);
+                boolean success = future.get(replicationTimeoutMs, TimeUnit.MILLISECONDS);
                 if (success) successCount++;
             } catch (TimeoutException e) {
-                log.warn("Replication timeout for {}-{}",
-                        topicName, partitionIndex);
+                log.warn("Replication timeout for {}-{}", topicName, partitionIndex);
             } catch (Exception e) {
                 log.error("Replication error: {}", e.getMessage());
             }
         }
 
-        int majority = (replicationFactor / 2) + 1;
+        int majority = (brokerRegistry.getBrokerCount() / 2) + 1;
         boolean majorityAchieved = successCount >= majority;
 
         if (!majorityAchieved) {
-            log.error("Failed majority replication for {}-{} offset {}. " +
-                            "Got {}/{} acks",
-                    topicName, partitionIndex, offset,
-                    successCount, replicationFactor);
+            log.error("Failed majority for {}-{} offset {}. Got {}/{} acks",
+                    topicName, partitionIndex, offset, successCount, majority);
         }
 
         return majorityAchieved;
@@ -200,7 +173,7 @@ public class ReplicationService {
                 .map(BrokerInfo::getBrokerId)
                 .collect(Collectors.toSet());
 
-        Set<String> isrFollowers = isrTracker.getISR(topicName, partitionIdx, followerIds);
+        Set<String> isrFollowers = isrTracker.getISR(topicName, partitionIdx, followerIds, leaderOffset);
 
         Map<String, Object> metrics = new HashMap<>();
         metrics.put("leaderOffset", leaderOffset);

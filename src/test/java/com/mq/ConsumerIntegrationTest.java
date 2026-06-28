@@ -24,7 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 // @DirtiesContext resets the Spring context after this test class
 // Important because LogManager holds file handles —
-// we want a fresh instance for each test run
+// we want a fresh inst ance for each test run
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class ConsumerIntegrationTest {
 
