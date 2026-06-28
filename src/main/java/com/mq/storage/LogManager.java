@@ -8,6 +8,9 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -152,6 +155,90 @@ public class LogManager {
 
     private String partitionKey(String topicName, int partitionIndex) {
         return topicName + "-" + partitionIndex;
+    }
+
+    public int getSegmentCount(String topicName, int partitionIdx) {
+        String key = partitionKey(topicName, partitionIdx);
+        List<LogSegment> segments = partitionSegments.get(key);
+        return segments == null ? 0 : segments.size();
+    }
+
+
+    public long getPartitionSize(String topicName, int partitionIdx) throws IOException {
+        String key = partitionKey(topicName, partitionIdx);
+        List<LogSegment> segments = partitionSegments.get(key);
+        if (segments == null) return 0L;
+        long total = 0;
+        for (LogSegment seg : segments) {
+            total += seg.size();
+        }
+        return total;
+    }
+
+    public int deleteSegmentsByTime(String topicName, int partitionIdx,
+                                    long retentionHours) throws IOException {
+        String key = partitionKey(topicName, partitionIdx);
+        List<LogSegment> segments = partitionSegments.get(key);
+        if (segments == null || segments.size() <= 1) return 0;
+
+        Instant threshold = Instant.now().minus(retentionHours, ChronoUnit.HOURS);
+        List<LogSegment> toDelete = new ArrayList<>();
+
+        // Only look at non-active segments (all except last)
+        List<LogSegment> candidates = segments.subList(0, segments.size() - 1);
+
+        for (LogSegment seg : candidates) {
+            Path logPath = partitionDir(topicName, partitionIdx)
+                    .resolve(String.format("%020d", seg.getBaseOffset()) + ".log");
+
+            if (!Files.exists(logPath)) continue;
+
+            BasicFileAttributes attrs = Files.readAttributes(logPath, BasicFileAttributes.class);
+            Instant lastModified = attrs.lastModifiedTime().toInstant();
+
+            if (lastModified.isBefore(threshold)) {
+                toDelete.add(seg);
+            }
+        }
+
+        for (LogSegment seg : toDelete) {
+            deleteSegment(topicName, partitionIdx, seg, segments);
+        }
+
+        return toDelete.size();
+    }
+
+    public int deleteSegmentsBySize(String topicName, int partitionIdx,
+                                    long maxBytes) throws IOException {
+        String key = partitionKey(topicName, partitionIdx);
+        List<LogSegment> segments = partitionSegments.get(key);
+        if (segments == null || segments.size() <= 1) return 0;
+
+        int deleted = 0;
+        while (segments.size() > 1 && getPartitionSize(topicName, partitionIdx) > maxBytes) {
+            LogSegment oldest = segments.get(0);
+            deleteSegment(topicName, partitionIdx, oldest, segments);
+            deleted++;
+        }
+        return deleted;
+    }
+
+    private void deleteSegment(String topicName, int partitionIdx,
+                               LogSegment segment, List<LogSegment> segments) throws IOException {
+        String name = String.format("%020d", segment.getBaseOffset());
+        Path dir = partitionDir(topicName, partitionIdx);
+
+        try {
+            segment.close();
+        } catch (IOException e) {
+            log.warn("Error closing segment {} before deletion: {}", name, e.getMessage());
+        }
+
+        Files.deleteIfExists(dir.resolve(name + ".log"));
+        Files.deleteIfExists(dir.resolve(name + ".index"));
+        segments.remove(segment);
+
+        log.info("Deleted segment {}/{} (baseOffset={})", topicName, partitionIdx, segment.getBaseOffset());
     }
 
     @PreDestroy

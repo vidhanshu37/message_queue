@@ -27,15 +27,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Component
 public class RaftNode {
 
-    // ── Persistent Raft state ────────────────────────────────────────────────
+    // Persistent Raft state
     private final AtomicInteger currentTerm = new AtomicInteger(0);
     private volatile String votedFor = null;
 
-    // ── Volatile Raft state ──────────────────────────────────────────────────
+    // Volatile Raft state
     @Getter private volatile RaftState state = RaftState.FOLLOWER;
     @Getter private volatile String currentLeaderId = null;
 
-    // ── Election timing ──────────────────────────────────────────────────────
+    // Election timing
     private volatile long lastHeartbeatTime;
     private volatile long electionDeadline;
 
@@ -43,7 +43,7 @@ public class RaftNode {
     private static final int ELECTION_TIMEOUT_MAX_MS = 700;
     private static final int HEARTBEAT_INTERVAL_MS   = 50;
 
-    // ── Dependencies ─────────────────────────────────────────────────────────
+    // Dependencies
     private final BrokerRegistry    brokerRegistry;
     private final PartitionMetadata partitionMetadata;
     private final LogManager        logManager;
@@ -54,7 +54,7 @@ public class RaftNode {
     @Value("${broker.id:broker-1}")
     private String currentBrokerId;
 
-    // ── Background threads ───────────────────────────────────────────────────
+    // Background threads
     private final ScheduledExecutorService electionExecutor =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "raft-election");
@@ -81,7 +81,7 @@ public class RaftNode {
         this.restTemplate      = restTemplate;
     }
 
-    // ── Lifecycle ────────────────────────────────────────────────────────────
+    // Lifecycle
 
     @PostConstruct
     public void start() {
@@ -108,7 +108,7 @@ public class RaftNode {
         log.info("RaftNode stopped");
     }
 
-    // ── Election timeout ─────────────────────────────────────────────────────
+    // Election timeout
 
     private void checkElectionTimeout() {
         if (state == RaftState.LEADER) return;
@@ -121,7 +121,6 @@ public class RaftNode {
         }
     }
 
-    /** Reset both the heartbeat timestamp and the fixed election deadline. */
     private void resetElectionDeadline() {
         long now = System.currentTimeMillis();
         lastHeartbeatTime = now;
@@ -138,7 +137,7 @@ public class RaftNode {
         electionDeadline = now + extraDelayMs + timeout;
     }
 
-    // ── Election logic ───────────────────────────────────────────────────────
+    // Election logic
 
     /**
      * Three-phase election:
@@ -147,7 +146,7 @@ public class RaftNode {
      *   Phase 3 (locked)   – evaluate result; become LEADER or revert to FOLLOWER
      */
     private void startElection() {
-        // ── Phase 1 ──────────────────────────────────────────────────────────
+        // Phase 1
         final int newTerm;
         final List<BrokerInfo> peers;
         final int majority;
@@ -177,7 +176,7 @@ public class RaftNode {
             majority = (totalNodes / 2) + 1;
         }
 
-        // ── Phase 2 (lock-free) ───────────────────────────────────────────────
+        // Phase 2 (lock-free)
         AtomicInteger voteCount = new AtomicInteger(1); // self-vote
 
         List<CompletableFuture<Void>> futures = peers.stream()
@@ -193,7 +192,7 @@ public class RaftNode {
             log.warn("Vote collection error for term {}: {}", newTerm, e.getMessage());
         }
 
-        // ── Phase 3 ──────────────────────────────────────────────────────────
+        // Phase 3
         synchronized (this) {
             if (state != RaftState.CANDIDATE) {
                 log.info("Election for term {} cancelled — state is now {}", newTerm, state);
@@ -244,7 +243,7 @@ public class RaftNode {
         });
     }
 
-    // ── Vote-granting (receiver side) ────────────────────────────────────────
+    // Vote-granting (receiver side)
 
     public synchronized RequestVoteResponse handleRequestVote(RequestVoteRequest request) {
         int candidateTerm = request.getTerm();
@@ -276,7 +275,6 @@ public class RaftNode {
         return new RequestVoteResponse(currentTerm.get(), false, currentBrokerId);
     }
 
-    // ── Heartbeat ────────────────────────────────────────────────────────────
 
     private void maybeSendHeartbeats() {
         if (state != RaftState.LEADER) return;
@@ -299,7 +297,6 @@ public class RaftNode {
                 becomeFollower(response.getTerm(), null);
             }
         } catch (Exception e) {
-            // FIX: catch here so one failed peer does NOT kill the heartbeat loop
             log.debug("Heartbeat to {} failed: {}", peer.getBrokerId(), e.getMessage());
         }
     }
@@ -325,34 +322,18 @@ public class RaftNode {
         }
 
         currentLeaderId = request.getLeaderId();
-        // FIX: use resetElectionDeadline() — updates BOTH lastHeartbeatTime AND electionDeadline
         resetElectionDeadline();
 
         return new HeartbeatResponse(currentTerm.get(), true, currentBrokerId);
     }
 
-    // ── State transitions ────────────────────────────────────────────────────
+    // State transitions
 
-    /** Must be called while holding the monitor. */
     private void becomeLeader(int term) {
         state           = RaftState.LEADER;
         currentLeaderId = currentBrokerId;
         log.info("||  BECAME LEADER for term {}   ||", term);
 
-        /**
-         * FIX (Bug 2 — PartitionMetadata lost on leader change):
-         *
-         * When a new Raft leader is elected, PartitionMetadata (which broker owns which
-         * partition) is in-memory only — it was built by the OLD leader during topic creation
-         * and lives only in that process. The new leader's PartitionMetadata is empty.
-         *
-         * Fix: re-run assignPartitions() for every topic immediately on becoming leader.
-         * This rebuilds the routing table from the consistent hash ring (which IS
-         * deterministic — same brokers → same assignments every time).
-         *
-         * This is exactly what Kafka's controller does: on controller failover, the new
-         * controller reads ZooKeeper and rebuilds all partition state from scratch.
-         */
         try {
             List<String> topicNames = topicRepository.findAll()
                     .stream().map(t -> t.getName()).toList();
@@ -382,7 +363,7 @@ public class RaftNode {
         log.info("Became FOLLOWER for term {}. Leader: {}", term, leaderId);
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    // Helpers
 
     private long getLatestLogOffset() {
         long max = 0;
@@ -402,6 +383,16 @@ public class RaftNode {
             log.debug("Error getting log offset: {}", e.getMessage());
         }
         return max;
+    }
+
+    public synchronized void stepDown() {
+        if (state == RaftState.LEADER) {
+            log.info("Stepping down from LEADER role (graceful shutdown). Term: {}", currentTerm.get());
+            state = RaftState.FOLLOWER;
+            currentLeaderId = null;
+            // Set a very short deadline so peers detect our absence quickly
+            resetElectionDeadline();
+        }
     }
 
     public int getCurrentTerm()  { return currentTerm.get(); }

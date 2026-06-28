@@ -2,12 +2,15 @@ package com.mq.config;
 
 import com.mq.cluster.BrokerRegistry;
 import com.mq.model.BrokerInfo;
+import com.mq.repository.TopicRepository;
+import com.mq.storage.LogManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.List;
@@ -17,8 +20,10 @@ import java.util.List;
 @RequiredArgsConstructor
 public class BrokerStartupConfig {
 
-    private final BrokerRegistry brokerRegistry;
-    private final RestTemplate restTemplate;
+    private final BrokerRegistry  brokerRegistry;
+    private final RestTemplate    restTemplate;
+    private final TopicRepository topicRepository;
+    private final LogManager      logManager;
 
     @Value("${broker.id:broker-1}")
     private String brokerId;
@@ -29,23 +34,19 @@ public class BrokerStartupConfig {
     @Value("${server.port:8082}")
     private int brokerPort;
 
-
     @Value("${cluster.peers:localhost:8082,localhost:8083,localhost:8084}")
     private String clusterPeers;
 
     @Bean
+    @Order(1)
     public ApplicationRunner selfRegister() {
         return args -> {
             BrokerInfo self = new BrokerInfo(brokerId, brokerHost, brokerPort);
-
-            // Step 1: Register self locally
             brokerRegistry.registerBroker(self);
             log.info("Self registered: {} in local registry", self);
 
-            // Step 2: Parse peer addresses from config
             List<String> peerUrls = parsePeerUrls(self);
 
-            // Step 3: For each peer, announce ourselves AND learn about them
             for (String peerUrl : peerUrls) {
                 try {
                     BrokerInfo[] knownBrokers = restTemplate.postForObject(
@@ -63,7 +64,6 @@ public class BrokerStartupConfig {
                         }
                     }
                 } catch (Exception e) {
-                    // Peer is not up yet — that's fine, it will contact us when it starts
                     log.debug("Peer at {} not reachable yet: {}", peerUrl, e.getMessage());
                 }
             }
@@ -75,11 +75,33 @@ public class BrokerStartupConfig {
         };
     }
 
+    @Bean
+    @Order(2)
+    public ApplicationRunner restorePartitionLogs() {
+        return args -> {
+            log.info("Restoring partition logs from DB after startup...");
+            int restored = 0;
+
+            for (var topic : topicRepository.findAll()) {
+                for (int p = 0; p < topic.getPartitionCount(); p++) {
+                    try {
+                        logManager.initPartition(topic.getName(), p);
+                        restored++;
+                    } catch (Exception e) {
+                        log.warn("Failed to restore partition {}-{}: {}",
+                                topic.getName(), p, e.getMessage());
+                    }
+                }
+            }
+
+            log.info("Partition log restore complete. {} partitions initialized.", restored);
+        };
+    }
+
     private List<String> parsePeerUrls(BrokerInfo self) {
         return java.util.Arrays.stream(clusterPeers.split(","))
                 .map(String::trim)
                 .filter(addr -> {
-                    // Exclude ourselves
                     String[] parts = addr.split(":");
                     if (parts.length != 2) return false;
                     String host = parts[0];
