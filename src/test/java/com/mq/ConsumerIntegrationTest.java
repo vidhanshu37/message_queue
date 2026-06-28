@@ -22,9 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 // @SpringBootTest with RANDOM_PORT starts the full Spring context
 // on a random port — no conflict with your running app
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-// @DirtiesContext resets the Spring context after this test class
-// Important because LogManager holds file handles —
-// we want a fresh inst ance for each test run
+
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class ConsumerIntegrationTest {
 
